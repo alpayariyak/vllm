@@ -2,30 +2,31 @@
 # Adapted from
 # https://github.com/THUDM/ChatGLM2-6B
 """Inference-only ChatGLM model compatible with THUDM weights."""
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn import LayerNorm
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.config import LoRAConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import PagedAttentionWithRoPE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+    VocabParallelEmbedding, ParallelLMHead)
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_world_size)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs import ChatGLMConfig
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 class GLMAttention(nn.Module):
@@ -74,41 +75,40 @@ class GLMAttention(nn.Module):
             linear_method=linear_method,
         )
 
-        # https://huggingface.co/THUDM/chatglm3-6b-32k/blob/e210410255278dd9d74463cf396ba559c0ef801c/modeling_chatglm.py#L141
-        rope_ratio = getattr(config, "rope_ratio", 1.0)
-        max_positions = getattr(config, "seq_length", 8192)
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim // 2,
-            max_position=max_positions,
-            base=10000 * rope_ratio,
-            is_neox_style=False,
-        )
-        self.attn = Attention(
+        self.attn = PagedAttentionWithRoPE(
             self.num_heads,
             self.head_dim,
             self.scaling,
+            rotary_dim=self.head_dim // 2,
             num_kv_heads=self.num_kv_heads,
+            is_neox_style=False,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(position_ids, q, k)
+        key_cache, value_cache = kv_cache
+
         context_layer = self.attn(
+            position_ids,
             q,
             k,
             v,
-            kv_cache,
-            attn_metadata,
+            key_cache,
+            value_cache,
+            input_metadata,
+            cache_event,
         )
+
         attn_output, _ = self.dense(context_layer)
+
         return attn_output
 
 
@@ -194,8 +194,9 @@ class GLMBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         # hidden_states: [num_tokens, h]
         # Layer norm at the beginning of the transformer layer.
@@ -205,7 +206,8 @@ class GLMBlock(nn.Module):
             hidden_states=layernorm_output,
             position_ids=position_ids,
             kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
+            cache_event=cache_event,
         )
 
         # Residual connection.
@@ -258,16 +260,19 @@ class GLMTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         for i in range(self.num_layers):
+            cache_event = None if cache_events is None else cache_events[i]
             layer = self.layers[i]
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache=kv_caches[i],
-                attn_metadata=attn_metadata,
+                input_metadata=input_metadata,
+                cache_event=cache_event,
             )
         # Final layer norm.
         if self.post_layer_norm:
@@ -300,9 +305,10 @@ class ChatGLMModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ):
         inputs_embeds = self.embedding(input_ids)
 
         # Run encoder.
@@ -310,75 +316,53 @@ class ChatGLMModel(nn.Module):
             hidden_states=inputs_embeds,
             position_ids=position_ids,
             kv_caches=kv_caches,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
+            cache_events=cache_events,
         )
+
         return hidden_states
 
 
 class ChatGLMForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "query_key_value": ["query_key_value"],
-        "dense_h_to_4h": ["dense_h_to_4h"]
-    }
-    # LoRA specific attributes
-    supported_lora_modules = [
-        "query_key_value",
-        "dense",
-        "dense_h_to_4h",
-        "dense_4h_to_h",
-    ]
-    embedding_modules = {}
-    embedding_padding_modules = []
 
     def __init__(
         self,
         config: ChatGLMConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        lora_config: Optional[LoRAConfig] = None,
     ):
         super().__init__()
         self.config: ChatGLMConfig = config
         self.linear_method = linear_method
         self.transformer = ChatGLMModel(config, linear_method)
         self.lm_head_weight = self.transformer.output_layer.weight
-        self.logits_processor = LogitsProcessor(config.padded_vocab_size)
-        self.sampler = Sampler()
+        self.sampler = Sampler(config.padded_vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ) -> SamplerOutput:
         hidden_states = self.transformer(input_ids, positions, kv_caches,
-                                         attn_metadata)
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head_weight, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+                                         input_metadata, cache_events)
+        next_tokens = self.sampler(self.lm_head_weight, hidden_states,
+                                   input_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if "rotary_pos_emb.inv_freq" in name:
                 continue
             if "word_embeddings" in name:
                 name = name.replace(".word_embeddings", "")
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
-                continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)

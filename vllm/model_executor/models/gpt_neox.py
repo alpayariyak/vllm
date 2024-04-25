@@ -16,27 +16,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-NeoX model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import GPTNeoXConfig
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import PagedAttentionWithRoPE
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearMethodBase,
                                                QKVParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+    VocabParallelEmbedding, ParallelLMHead)
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_world_size)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 class GPTNeoXAttention(nn.Module):
@@ -50,7 +52,6 @@ class GPTNeoXAttention(nn.Module):
         self.total_num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.total_num_heads
-        self.bias = getattr(config, "attention_bias", True)
 
         tensor_model_parallel_world_size = (
             get_tensor_model_parallel_world_size())
@@ -62,40 +63,41 @@ class GPTNeoXAttention(nn.Module):
             config.hidden_size,
             self.head_size,
             self.total_num_heads,
-            bias=self.bias,
             linear_method=linear_method,
         )
         self.dense = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
-            bias=self.bias,
             linear_method=linear_method,
         )
+
         scaling = self.head_size**-0.5
         rotary_dim = int(self.head_size * config.rotary_pct)
         assert rotary_dim % 2 == 0
         rope_theta = getattr(config, "rope_theta", 10000)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
-        self.rotary_emb = get_rope(
+        self.attn = PagedAttentionWithRoPE(
+            self.num_heads,
             self.head_size,
-            rotary_dim=rotary_dim,
-            max_position=max_position_embeddings,
+            scaling,
+            rotary_dim,
             base=rope_theta,
-        )
-        self.attn = Attention(self.num_heads, self.head_size, scaling)
+            max_position=max_position_embeddings)
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        q, k = self.rotary_emb(position_ids, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        k_cache, v_cache = kv_cache
+        attn_output = self.attn(position_ids, q, k, v, k_cache, v_cache,
+                                input_metadata, cache_event)
         output, _ = self.dense(attn_output)
         return output
 
@@ -149,15 +151,17 @@ class GPTNeoXLayer(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         attn_input = self.input_layernorm(hidden_states)
         attn_output = self.attention(
             position_ids=position_ids,
             hidden_states=attn_input,
             kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
+            cache_event=cache_event,
         )
 
         if self.use_parallel_residual:
@@ -202,17 +206,20 @@ class GPTNeoXModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         hidden_states = self.embed_in(input_ids)
         for i in range(len(self.layers)):
+            cache_event = None if cache_events is None else cache_events[i]
             layer = self.layers[i]
             hidden_states = layer(
                 position_ids,
                 hidden_states,
                 kv_caches[i],
-                attn_metadata,
+                input_metadata,
+                cache_event,
             )
         hidden_states = self.final_layer_norm(hidden_states)
         return hidden_states
@@ -233,44 +240,32 @@ class GPTNeoXForCausalLM(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ) -> SamplerOutput:
         hidden_states = self.gpt_neox(input_ids, positions, kv_caches,
-                                      attn_metadata)
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.embed_out.weight, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+                                      input_metadata, cache_events)
+        next_tokens = self.sampler(self.embed_out.weight, hidden_states,
+                                   input_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if ("attention.bias" in name or "attention.masked_bias" in name
                     or "rotary_emb.inv_freq" in name):
-                continue
-            if ("rotary_emb.cos_cached" in name
-                    or "rotary_emb.sin_cached" in name):
-                # Models trained using OpenRLHF may include
-                # these tensors in the checkpoint. Skip them.
                 continue
             param = params_dict[name]
 

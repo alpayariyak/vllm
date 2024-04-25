@@ -1,7 +1,7 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/bloom/modeling_bloom.py
-# Copyright 2023 The vLLM team.
+# Copyright 2023 The CacheFlow team.
 # Copyright 2022 HuggingFace Inc. team and BigScience workshop.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,27 +17,29 @@
 # limitations under the License.
 """Inference-only BLOOM model compatible with HuggingFace weights."""
 import math
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import BloomConfig
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import PagedAttentionWithALiBi
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearMethodBase,
                                                QKVParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -104,22 +106,23 @@ class BloomAttention(nn.Module):
         alibi_slopes = alibi_slopes[head_start:head_end].tolist()
 
         scaling = self.head_dim**-0.5
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              scaling,
-                              alibi_slopes=alibi_slopes)
+        self.attn = PagedAttentionWithALiBi(self.num_heads, self.head_dim,
+                                            scaling, alibi_slopes)
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         del position_ids  # Unused.
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        k_cache, v_cache = kv_cache
+        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
+                                cache_event)
         output, _ = self.dense(attn_output)
         return output
 
@@ -176,8 +179,9 @@ class BloomBlock(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
@@ -193,7 +197,8 @@ class BloomBlock(nn.Module):
             position_ids=position_ids,
             hidden_states=layernorm_output,
             kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
+            cache_event=cache_event,
         )
         attention_output = attention_output + residual
         layernorm_output = self.post_attention_layernorm(attention_output)
@@ -240,18 +245,21 @@ class BloomModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         hidden_states = self.word_embeddings(input_ids)
         hidden_states = self.word_embeddings_layernorm(hidden_states)
         for i in range(len(self.h)):
+            cache_event = None if cache_events is None else cache_events[i]
             layer = self.h[i]
             hidden_states = layer(
                 position_ids,
                 hidden_states,
                 kv_caches[i],
-                attn_metadata,
+                input_metadata,
+                cache_event,
             )
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
@@ -269,37 +277,30 @@ class BloomForCausalLM(nn.Module):
         self.linear_method = linear_method
         self.transformer = BloomModel(config, linear_method)
         self.lm_head_weight = self.transformer.word_embeddings.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ) -> SamplerOutput:
         hidden_states = self.transformer(input_ids, positions, kv_caches,
-                                         attn_metadata)
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head_weight, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+                                         input_metadata, cache_events)
+        next_tokens = self.sampler(self.lm_head_weight, hidden_states,
+                                   input_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if name == "lm_head.weight":
                 continue
             if not name.startswith("transformer."):

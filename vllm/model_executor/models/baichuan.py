@@ -19,30 +19,31 @@
 # limitations under the License.
 """Inference-only BaiChuan model compatible with HuggingFace weights."""
 import math
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.config import LoRAConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import (PagedAttentionWithRoPE,
+                                                  PagedAttentionWithALiBi)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+    VocabParallelEmbedding, ParallelLMHead)
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+from vllm.transformers_utils.configs.baichuan import BaiChuanConfig
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -149,32 +150,36 @@ class BaiChuanAttention(nn.Module):
             alibi_slopes = alibi_slopes[head_start:head_end].tolist()
 
             scaling = self.head_dim**-0.5
-            self.attn = Attention(self.num_heads,
-                                  self.head_dim,
-                                  scaling,
-                                  alibi_slopes=alibi_slopes)
+            self.attn = PagedAttentionWithALiBi(self.num_heads, self.head_dim,
+                                                scaling, alibi_slopes)
         else:
-            self.rotary_emb = get_rope(
-                self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
             self.scaling = self.head_dim**-0.5
-            self.attn = Attention(self.num_heads, self.head_dim, self.scaling)
+            self.attn = PagedAttentionWithRoPE(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                rotary_dim=self.head_dim,
+                base=self.rope_theta,
+                max_position=self.max_position_embeddings)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.W_pack(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        if self.postion_embedding != "ALIBI":
-            q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        k_cache, v_cache = kv_cache
+        if self.postion_embedding == "ALIBI":
+            attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
+                                    cache_event)
+        else:
+            attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
+                                    input_metadata, cache_event)
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -182,7 +187,7 @@ class BaiChuanAttention(nn.Module):
 class BaiChuanDecoderLayer(nn.Module):
 
     def __init__(self,
-                 config: PretrainedConfig,
+                 config: BaiChuanConfig,
                  position_embedding: str,
                  linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
@@ -213,8 +218,9 @@ class BaiChuanDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -228,7 +234,8 @@ class BaiChuanDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
+            cache_event=cache_event,
         )
 
         # Fully Connected
@@ -241,7 +248,7 @@ class BaiChuanDecoderLayer(nn.Module):
 class BaiChuanModel(nn.Module):
 
     def __init__(self,
-                 config: PretrainedConfig,
+                 config: BaiChuanConfig,
                  position_embedding: str,
                  linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
@@ -263,18 +270,21 @@ class BaiChuanModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
+            cache_event = None if cache_events is None else cache_events[i]
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 kv_caches[i],
-                attn_metadata,
+                input_metadata,
+                cache_event,
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -282,128 +292,72 @@ class BaiChuanModel(nn.Module):
 
 
 class BaiChuanBaseForCausalLM(nn.Module):
-    packed_modules_mapping = {
-        "W_pack": ["W_pack"],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
-    }
-    # LoRA specific attributes
-    supported_lora_modules = [
-        "W_pack",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
-    ]
-    embedding_modules = {}
-    embedding_padding_modules = []
 
-    def __init__(
-        self,
-        config,
-        position_embedding: str,
-        linear_method: Optional[LinearMethodBase] = None,
-        lora_config: Optional[LoRAConfig] = None,
-    ):
+    def __init__(self,
+                 config,
+                 position_embedding: str,
+                 linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
         self.model = BaiChuanModel(config, position_embedding, linear_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ) -> SamplerOutput:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head.weight, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+                                   input_metadata, cache_events)
+        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
+                                   input_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if "rotary_emb.inv_freq" in name:
                 continue
-            if name == "lm_head.weight":
-                # Unlike Baichuan, Baichuan2 normalizes the head weights.
-                # Refer to:
-                # https://huggingface.co/baichuan-inc/Baichuan2-7B-Chat/blob/84603cde5ebffb6084e476cfaeceaf0b8b91fe54/modeling_baichuan.py#L508
-                # Distinguish between Baichuan and Baichuan2 by checking the
-                # vocab size. This is suggested by
-                # https://github.com/vllm-project/vllm/pull/1022#discussion_r1325652704
-                is_baichuan2 = self.config.vocab_size == 125696
-                if is_baichuan2:
-                    loaded_weight = torch.nn.functional.normalize(
-                        loaded_weight)
-
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
+                param = params_dict[name.replace(weight_name, param_name)]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
 
 
-class BaichuanForCausalLM(BaiChuanBaseForCausalLM):
-    """Baichuan 13B and Baichuan2 7B/13B."""
+class BaichuanForCausalLM(BaiChuanBaseForCausalLM):  # baichuan 13b
 
-    def __init__(
-        self,
-        config,
-        linear_method: Optional[LinearMethodBase] = None,
-        lora_config: Optional[LoRAConfig] = None,
-    ):
-        if config.hidden_size == 4096:  # baichuan2 7b
-            super().__init__(config, "ROPE", linear_method, lora_config)
-        else:  # baichuan 13b, baichuan2 13b
-            super().__init__(config, "ALIBI", linear_method, lora_config)
+    def __init__(self,
+                 config,
+                 linear_method: Optional[LinearMethodBase] = None):
+        super().__init__(config, "ALIBI", linear_method)
 
 
-class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):
-    """Baichuan 7B."""
+class BaiChuanForCausalLM(BaiChuanBaseForCausalLM):  # baichuan 7b
 
-    def __init__(
-        self,
-        config,
-        linear_method: Optional[LinearMethodBase] = None,
-        lora_config: Optional[LoRAConfig] = None,
-    ):
-        super().__init__(config, "ROPE", linear_method, lora_config)
+    def __init__(self,
+                 config,
+                 linear_method: Optional[LinearMethodBase] = None):
+        super().__init__(config, "ROPE", linear_method)

@@ -1,15 +1,14 @@
 """Custom activation functions."""
-import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from vllm import _custom_ops as ops
-from vllm.distributed import (divide, get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm._C import ops
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
+from vllm.model_executor.parallel_utils.utils import divide
 from vllm.model_executor.utils import set_weight_attrs
 
 
@@ -19,14 +18,9 @@ class SiluAndMul(nn.Module):
     The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[-1] // 2.
 
     Shapes:
-        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
-        return: (num_tokens, d) or (batch_size, seq_len, d)
+        x: (batch_size, seq_len, 2 * d) or (num_tokens, 2 * d)
+        return: (batch_size, seq_len, d) or (num_tokens, d)
     """
-
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -36,45 +30,7 @@ class SiluAndMul(nn.Module):
         return out
 
 
-class GeluAndMul(nn.Module):
-    """An activation function for GeGLU.
-
-    The function computes x -> GELU(x[:d]) * x[d:] where d = x.shape[-1] // 2.
-
-    Shapes:
-        x: (batch_size, seq_len, 2 * d) or (num_tokens, 2 * d)
-        return: (batch_size, seq_len, d) or (num_tokens, d)
-    """
-
-    def __init__(self, approximate: str = "none"):
-        super().__init__()
-        self.approximate = approximate
-        if approximate not in ("none", "tanh"):
-            raise ValueError(f"Unknown approximate mode: {approximate}")
-
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        d = x.shape[-1] // 2
-        return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if self.approximate == "none":
-            ops.gelu_and_mul(out, x)
-        elif self.approximate == "tanh":
-            ops.gelu_tanh_and_mul(out, x)
-        return out
-
-
 class NewGELU(nn.Module):
-
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        c = math.sqrt(2.0 / math.pi)
-        return 0.5 * x * (1.0 + torch.tanh(c *
-                                           (x + 0.044715 * torch.pow(x, 3.0))))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
@@ -83,11 +39,6 @@ class NewGELU(nn.Module):
 
 
 class FastGELU(nn.Module):
-
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 *
-                                           (1.0 + 0.044715 * x * x)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
@@ -120,7 +71,9 @@ class ScaledActivation(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.scales = nn.Parameter(
-            torch.empty(intermediate_size_per_partition, dtype=params_dtype))
+            torch.empty(intermediate_size_per_partition,
+                        dtype=params_dtype,
+                        device="cuda"))
         set_weight_attrs(self.scales, {"weight_loader": self.weight_loader})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -17,27 +17,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only OPT model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import OPTConfig
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearMethodBase,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_world_size)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -85,19 +88,22 @@ class OPTAttention(nn.Module):
             bias=bias,
             linear_method=linear_method,
         )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              scale=self.scaling)
+        self.attn = PagedAttention(self.num_heads,
+                                   self.head_dim,
+                                   scale=self.scaling)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        key_cache, value_cache = kv_cache
+        attn_output = self.attn(q, k, v, key_cache, value_cache,
+                                input_metadata, cache_event)
         output, _ = self.out_proj(attn_output)
         return output
 
@@ -145,8 +151,9 @@ class OPTDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -155,7 +162,8 @@ class OPTDecoderLayer(nn.Module):
             hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states=hidden_states,
                                        kv_cache=kv_cache,
-                                       attn_metadata=attn_metadata)
+                                       input_metadata=input_metadata,
+                                       cache_event=cache_event)
         hidden_states = residual + hidden_states
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -234,8 +242,9 @@ class OPTDecoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
         pos_embeds = self.embed_positions(positions)
@@ -244,8 +253,10 @@ class OPTDecoder(nn.Module):
         hidden_states = inputs_embeds + pos_embeds
 
         for i in range(len(self.layers)):
+            cache_event = None if cache_events is None else cache_events[i]
             layer = self.layers[i]
-            hidden_states = layer(hidden_states, kv_caches[i], attn_metadata)
+            hidden_states = layer(hidden_states, kv_caches[i], input_metadata,
+                                  cache_event)
 
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
@@ -268,10 +279,12 @@ class OPTModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
-        return self.decoder(input_ids, positions, kv_caches, attn_metadata)
+        return self.decoder(input_ids, positions, kv_caches, input_metadata,
+                            cache_events)
 
 
 class OPTForCausalLM(nn.Module):
@@ -286,35 +299,27 @@ class OPTForCausalLM(nn.Module):
         self.linear_method = linear_method
         self.model = OPTModel(config, linear_method)
         self.lm_head_weight = self.model.decoder.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+        cache_events: Optional[List[torch.cuda.Event]],
+    ) -> SamplerOutput:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head_weight, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+                                   input_metadata, cache_events)
+        next_tokens = self.sampler(self.lm_head_weight, hidden_states,
+                                   input_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -322,7 +327,8 @@ class OPTForCausalLM(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             if "lm_head.weight" in name:
                 continue
             if name.startswith("decoder."):
@@ -331,18 +337,11 @@ class OPTForCausalLM(nn.Module):
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
+                param = params_dict[name.replace(weight_name, param_name)]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

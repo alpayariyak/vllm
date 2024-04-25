@@ -89,7 +89,7 @@ Tensorizer can also be invoked with the `LLM` class directly to load models:
     llm = LLM(model="facebook/opt-125m",
               load_format="tensorizer",
               tensorizer_uri=path_to_opt_tensors,
-              num_readers=3,
+              num_readers=None, # Dynamically set based on model size and available memory resources.
               vllm_tensorized=True)
 """
 

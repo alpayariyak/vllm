@@ -3,11 +3,10 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import _custom_ops as ops
+from vllm._C import ops
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                set_weight_attrs)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
 class AWQConfig(QuantizationConfig):
@@ -51,8 +50,7 @@ class AWQConfig(QuantizationConfig):
     def get_config_filenames() -> List[str]:
         return [
             "quant_config.json",  # E.g., casperhansen/vicuna-7b-v1.5-awq
-            # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
-            "quantize_config.json",
+            "quantize_config.json",  # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
         ]
 
     @classmethod
@@ -79,19 +77,14 @@ class AWQLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
 
-    def create_weights(self, layer: torch.nn.Module,
-                       input_size_per_partition: int,
-                       output_partition_sizes: List[int], input_size: int,
-                       output_size: int, params_dtype: torch.dtype,
-                       **extra_weight_attrs):
-        if input_size_per_partition % self.quant_config.group_size != 0:
+    def create_weights(self, input_size: int, output_size: int,
+                       params_dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+        if input_size % self.quant_config.group_size != 0:
             raise ValueError(
                 "The input size is not aligned with the quantized "
                 "weight shape. This can be caused by too large "
                 "tensor parallel size.")
-
-        output_size_per_partition = sum(output_partition_sizes)
-        if output_size_per_partition % self.quant_config.pack_factor != 0:
+        if output_size % self.quant_config.pack_factor != 0:
             raise ValueError(
                 "The output size is not aligned with the quantized "
                 "weight shape. This can be caused by too large "
@@ -99,8 +92,9 @@ class AWQLinearMethod(LinearMethodBase):
 
         qweight = Parameter(
             torch.empty(
-                input_size_per_partition,
-                output_size_per_partition // self.quant_config.pack_factor,
+                input_size,
+                output_size // self.quant_config.pack_factor,
+                device="cuda",
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -114,8 +108,9 @@ class AWQLinearMethod(LinearMethodBase):
             })
         qzeros = Parameter(
             torch.empty(
-                input_size_per_partition // self.quant_config.group_size,
-                output_size_per_partition // self.quant_config.pack_factor,
+                input_size // self.quant_config.group_size,
+                output_size // self.quant_config.pack_factor,
+                device="cuda",
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -129,8 +124,9 @@ class AWQLinearMethod(LinearMethodBase):
             })
         scales = Parameter(
             torch.empty(
-                input_size_per_partition // self.quant_config.group_size,
-                output_size_per_partition,
+                input_size // self.quant_config.group_size,
+                output_size,
+                device="cuda",
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -139,34 +135,23 @@ class AWQLinearMethod(LinearMethodBase):
             "input_dim": 0,
             "output_dim": 1,
         })
-
-        layer.register_parameter("qweight", qweight)
-        set_weight_attrs(qweight, extra_weight_attrs)
-        layer.register_parameter("qzeros", qzeros)
-        set_weight_attrs(qzeros, extra_weight_attrs)
-        layer.register_parameter("scales", scales)
-        set_weight_attrs(scales, extra_weight_attrs)
+        return {
+            "qweight": qweight,
+            "qzeros": qzeros,
+            "scales": scales,
+        }
 
     def apply_weights(self,
-                      layer: torch.nn.Module,
+                      weights: Dict[str, torch.Tensor],
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        qweight = layer.qweight
-        scales = layer.scales
-        qzeros = layer.qzeros
+        qweight = weights["qweight"]
+        qzeros = weights["qzeros"]
+        scales = weights["scales"]
         pack_factor = self.quant_config.pack_factor
         out_shape = (x.shape[:-1] + (qweight.shape[-1] * pack_factor, ))
         reshaped_x = x.reshape(-1, x.shape[-1])
-
-        # num_tokens >= threshold
-        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
-
-        if FP16_MATMUL_HEURISTIC_CONDITION:
-            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-            out = torch.matmul(reshaped_x, out)
-        else:
-            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros,
-                               pack_factor)
+        out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
         if bias is not None:
-            out.add_(bias)
+            out = out + bias
         return out.reshape(out_shape)

@@ -1,27 +1,30 @@
 # coding=utf-8
 # Adapted from https://huggingface.co/mosaicml/mpt-7b/tree/main
 import math
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from vllm.attention import Attention, AttentionMetadata
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearMethodBase,
                                                QKVParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs.mpt import MPTConfig
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 def _get_alibi_slopes(
@@ -47,14 +50,9 @@ class MPTAttention(nn.Module):
         super().__init__()
         self.d_model = config.d_model
         self.total_num_heads = config.n_heads
-        self.head_dim = self.d_model // self.total_num_heads
         self.clip_qkv = config.attn_config["clip_qkv"]
         self.qk_ln = config.attn_config["qk_ln"]
         self.alibi_bias_max = config.attn_config["alibi_bias_max"]
-        if "kv_n_heads" in config.attn_config:
-            self.total_num_kv_heads = config.attn_config['kv_n_heads']
-        else:
-            self.total_num_kv_heads = self.total_num_heads
         assert not config.attn_config["prefix_lm"]
         assert config.attn_config["alibi"]
 
@@ -63,7 +61,6 @@ class MPTAttention(nn.Module):
             self.d_model,
             self.d_model // self.total_num_heads,
             self.total_num_heads,
-            self.total_num_kv_heads,
             bias=not config.no_bias,
             linear_method=linear_method,
         )
@@ -81,17 +78,6 @@ class MPTAttention(nn.Module):
         assert self.total_num_heads % tp_world_size == 0
         self.num_heads = self.total_num_heads // tp_world_size
 
-        if self.total_num_kv_heads >= tp_world_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_world_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_world_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_world_size)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
         # Create the alibi slopes and slice them.
         tp_rank = get_tensor_model_parallel_rank()
         head_start = tp_rank * self.num_heads
@@ -102,28 +88,28 @@ class MPTAttention(nn.Module):
 
         self.head_dim = self.d_model // self.total_num_heads
         scaling = self.head_dim**-0.5
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              scaling,
-                              alibi_slopes=alibi_slopes,
-                              num_kv_heads=self.num_kv_heads)
+        self.attn = PagedAttention(self.num_heads,
+                                   self.head_dim,
+                                   scaling,
+                                   alibi_slopes=alibi_slopes)
 
     def forward(
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         del position_ids  # unused.
         qkv, _ = self.Wqkv(hidden_states)
         if self.clip_qkv is not None:
             qkv.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.chunk(chunks=3, dim=-1)
         if self.qk_ln:
             q = self.q_ln(q)
             k = self.k_ln(k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        k_cache, v_cache = kv_cache
+        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
         output, _ = self.out_proj(attn_output)
         return output
 
@@ -179,15 +165,15 @@ class MPTBlock(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        kv_cache: KVCache,
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         x = self.norm_1(hidden_states)
         x = self.attn(
             position_ids=position_ids,
             hidden_states=x,
             kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
+            input_metadata=input_metadata,
         )
         hidden_states = hidden_states + x
         x = self.norm_2(hidden_states)
@@ -225,8 +211,8 @@ class MPTModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
     ) -> torch.Tensor:
         hidden_states = self.wte(input_ids)
         for i in range(len(self.blocks)):
@@ -235,7 +221,7 @@ class MPTModel(nn.Module):
                 position_ids,
                 hidden_states,
                 kv_caches[i],
-                attn_metadata,
+                input_metadata,
             )
         hidden_states = self.norm_f(hidden_states)
         return hidden_states
@@ -255,40 +241,36 @@ class MPTForCausalLM(nn.Module):
 
         self.transformer = MPTModel(config, linear_method)
         self.lm_head_weight = self.transformer.wte.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = Sampler()
+        self.sampler = Sampler(config.vocab_size)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
+        kv_caches: List[KVCache],
+        input_metadata: InputMetadata,
+    ) -> SamplerOutput:
         hidden_states = self.transformer(input_ids, positions, kv_caches,
-                                         attn_metadata)
+                                         input_metadata)
         return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head_weight, hidden_states,
-                                       sampling_metadata)
-        return logits
 
     def sample(
         self,
-        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
+    ) -> SamplerOutput:
+        next_tokens = self.sampler(self.lm_head_weight, hidden_states,
+                                   sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self,
+                     model_name_or_path: str,
+                     cache_dir: Optional[str] = None,
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
-                continue
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
